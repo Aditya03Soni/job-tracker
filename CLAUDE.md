@@ -9,6 +9,10 @@ Local job application tracker — React + Vite frontend (port 5173), Express bac
 **Start server:** `node server.js` from `~/Downloads/Job_Search/`  
 **Start client:** `npm run dev` from `~/Downloads/Job_Search/client/`
 
+## GitHub repository
+
+**Private repo:** https://github.com/Aditya03Soni/job-tracker
+
 ## Vercel deployment
 
 Frontend deployed at **https://job-tracker-aditya-eight.vercel.app** (project `adi-s-project69/job-tracker-aditya`).
