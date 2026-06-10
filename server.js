@@ -72,6 +72,111 @@ function sanitizeResumeContent(c) {
   return { ...c, experiences };
 }
 
+// ---------------------------------------------------------------------------
+// Batch bullet fill — single API call for all under-generated experiences
+// ---------------------------------------------------------------------------
+async function batchFillBullets(underGenerated, job, openrouter_api_key, model) {
+  const experiencesBlock = underGenerated.map((e, i) => {
+    const existing = (e.bullets || []).map((b, j) => `  ${j + 1}. ${b}`).join('\n') || '  (none yet)';
+    return `[${i}] ${e.title} at ${e.company} (${e.dates}) — needs ${3 - (e.bullets || []).length} bullet(s)\nExisting bullets (DO NOT repeat):\n${existing}`;
+  }).join('\n\n');
+
+  const prompt = `You are filling in missing resume bullets. For each experience below, generate exactly the number of bullets requested.
+
+Job context: ${job.title} at ${job.company}
+Description excerpt: ${(job.description || '').slice(0, 800)}
+
+Experiences needing bullets:
+${experiencesBlock}
+
+Rules:
+- Each bullet must be specific and include a real number, %, $, or named deliverable
+- Start each bullet with a strong past-tense action verb (Built, Drove, Reduced, Led, Designed, ...)
+- NEVER end with "supporting X", "enhancing Y", "demonstrating skills in Z", "providing insights into X"
+- Return ONLY a JSON object keyed by index: {"0": ["bullet..."], "1": ["bullet...", "bullet..."]}`;
+
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${openrouter_api_key}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'http://localhost:5173',
+      'X-Title': 'Job Tracker',
+    },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], temperature: 0.3 }),
+  });
+
+  if (!res.ok) throw new Error(`Batch fill API error: ${res.status}`);
+  const json = await res.json();
+  let raw = json.choices[0].message.content.trim();
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) raw = fenceMatch[1].trim();
+  return JSON.parse(raw);
+}
+
+// ---------------------------------------------------------------------------
+// ATS keyword extraction + scoring
+// ---------------------------------------------------------------------------
+async function extractJdKeywords(jdText, openrouter_api_key, keywordModel) {
+  if (!jdText || jdText.length < 50) return [];
+
+  const prompt = `Extract the 10-15 most important ATS keywords from this job description.
+Focus on: required/preferred technical skills, tools, frameworks, domain terms, and role-specific action nouns.
+Exclude generic words like "team", "work", "role", "company", "experience", "candidate".
+
+Job Description:
+${jdText.slice(0, 3000)}
+
+Return ONLY a JSON array of strings — e.g. ["Python", "SQL", "data pipeline", "stakeholder alignment"]`;
+
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openrouter_api_key}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'http://localhost:5173',
+        'X-Title': 'Job Tracker',
+      },
+      body: JSON.stringify({
+        model: keywordModel || 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+      }),
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    let raw = json.choices[0].message.content.trim();
+    const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenceMatch) raw = fenceMatch[1].trim();
+    const keywords = JSON.parse(raw);
+    return Array.isArray(keywords) ? keywords.filter(k => typeof k === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function computeAtsScore(resumeContent, keywords) {
+  if (!keywords || keywords.length === 0) {
+    return { score: null, matched_keywords: [], missing_keywords: [], keywords_extracted: [] };
+  }
+
+  const allText = [
+    resumeContent.technical_skills || '',
+    resumeContent.business_skills || '',
+    resumeContent.coursework || '',
+    ...(resumeContent.experiences || []).flatMap(e => e.bullets || []),
+    ...(resumeContent.projects || []).flatMap(p => p.bullets || []),
+    resumeContent.cover_letter || '',
+  ].join(' ').toLowerCase();
+
+  const matched = keywords.filter(k => allText.includes(k.toLowerCase()));
+  const missing = keywords.filter(k => !allText.includes(k.toLowerCase()));
+  const score = Math.round((matched.length / keywords.length) * 1000) / 10;
+
+  return { score, matched_keywords: matched, missing_keywords: missing, keywords_extracted: keywords };
+}
+
 function buildResumeLatex(c) {
   const expEntries = (c.experiences || []).map(e =>
     `    \\resumeSubheading\n      {${tex(e.company)}}{${tex(e.location)}}\n      {${tex(e.title)}}{${tex(e.dates)}}\n      \\resumeItemListStart\n${(e.bullets || []).map(b => `        \\resumeItem{${tex(b)}}`).join('\n')}\n      \\resumeItemListEnd`
@@ -202,7 +307,15 @@ ${projEntries}
 // ---------------------------------------------------------------------------
 // AI kit prompt
 // ---------------------------------------------------------------------------
-function buildKitPrompt(profile, job) {
+function buildKitPrompt(profile, job, keywords = []) {
+  const keywordsBlock = keywords.length > 0
+    ? `\nATS KEYWORDS — use these exact terms naturally across skills and bullets (do not force or repeat awkwardly):\n${keywords.join(', ')}\nEach keyword should appear at least once across skills + bullets combined. For skills the candidate clearly lacks, frame adjacent transferable experience — never fabricate.\n`
+    : '';
+
+  const selfCheckKeywordLine = keywords.length > 0
+    ? '[ ] Uses at least one keyword from the ATS KEYWORDS list\n'
+    : '';
+
   return `You are an expert resume writer and career coach. Return ONLY valid JSON — no markdown fences, no explanation.
 
 Given the candidate profile and job below, create tailored resume content and application materials.
@@ -216,6 +329,11 @@ Company: ${job.company || 'Not specified'}
 Location: ${job.location || 'Not specified'}
 Description:
 ${(job.description || '').slice(0, 4000)}
+
+REASONING STEP (mental only — do NOT include in output):
+1. Identify the 5 most critical requirements in the JD.
+2. For each work experience, decide which 1-2 requirements it best demonstrates.
+3. Ensure every requirement from step 1 is addressed at least once across all experience bullets.
 
 Return exactly this JSON structure:
 {
@@ -239,7 +357,7 @@ Return exactly this JSON structure:
       "bullets": ["bullet 1", "bullet 2"]
     }
   ],
-  "cover_letter": "full professional cover letter addressed to the hiring team (3-4 paragraphs, no placeholders)",
+  "cover_letter": "full professional cover letter (4 paragraphs): P1 — hook specific to this company's product, mission, or recent news (reference the company_brief you generate); P2 — strongest matching experience with a specific metric; P3 — bridge between the candidate's trajectory and this role's growth path; P4 — concise call to action. NEVER open with 'I am excited to apply' or 'I am writing to express my interest' or any similar generic opener.",
   "interview_questions": ["q1", "q2", "q3", "q4", "q5"],
   "company_brief": "2-3 sentences: what the company does and why this role is a strong fit for the candidate"
 }
@@ -263,8 +381,13 @@ Rules:
   Replace each with the actual number, decision, or deliverable that resulted
 - Project bullets must state a real output: ARIMA MAPE figure, DCF valuation range, IRR/cap rate, % improvement, etc.
 - Apple DCF bullet must include a specific implied share price or enterprise value estimate
-- Cover letter must name the company and role specifically — no generic placeholders
-- Interview questions should be insightful behavioral/situational questions for this specific role`;
+- Interview questions should be insightful behavioral/situational questions for this specific role
+${keywordsBlock}
+SELF-CHECK each bullet before finalizing:
+[ ] Starts with a strong past-tense action verb (Built, Drove, Reduced, Designed, Led, Analyzed, Developed, Automated, ...)
+[ ] Contains at least one quantity (number, %, $, named deliverable, or time saved)
+${selfCheckKeywordLine}[ ] Does NOT end with a vague phrase from the FORBIDDEN list above
+Rewrite any bullet that fails a check before including it in the JSON.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +461,14 @@ app.post('/api/jobs/:id/kit', async (req, res) => {
     if (!openrouter_api_key) return res.status(400).json({ error: 'OpenRouter API key not configured in Settings' });
     if (!profile) return res.status(400).json({ error: 'Profile not configured in Settings' });
 
-    const prompt = buildKitPrompt(profile, job);
     const model = openrouter_model || 'anthropic/claude-sonnet-4-5';
+    const keywordModel = data.settings.keyword_model || 'openai/gpt-4o-mini';
+
+    // Extract ATS keywords from the JD (lightweight separate call using a fast model)
+    const keywords = await extractJdKeywords(job.description || '', openrouter_api_key, keywordModel);
+    if (keywords.length > 0) console.log(`[ats] Extracted ${keywords.length} keywords:`, keywords.join(', '));
+
+    const prompt = buildKitPrompt(profile, job, keywords);
 
     const aiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -375,53 +504,34 @@ app.post('/api/jobs/:id/kit', async (req, res) => {
 
     resumeContent = sanitizeResumeContent(resumeContent);
 
-    // Fill any experience that came back with fewer than 3 bullets
+    // Batch-fill all under-generated experiences in a single API call
     const underGenerated = resumeContent.experiences.filter(e => (e.bullets || []).length < 3);
-    for (const exp of underGenerated) {
-      const needed = 3 - exp.bullets.length;
-      const fillPrompt = `Generate exactly ${needed} additional resume bullet point(s) for this work experience, tailored to the job below.
-
-Experience: ${exp.title} at ${exp.company} (${exp.dates})
-Existing bullets (do NOT repeat these):
-${exp.bullets.map((b, i) => `${i + 1}. ${b}`).join('\n')}
-
-Job: ${job.title} at ${job.company}
-Description excerpt: ${(job.description || '').slice(0, 800)}
-
-Rules:
-- Each bullet must be specific and include a real number, %, $, or named deliverable
-- NEVER end with "supporting X", "enhancing Y", "demonstrating skills in Z", "providing insights into X"
-- Return ONLY a JSON array of strings — e.g. ["Bullet one text.", "Bullet two text."]`;
-
+    if (underGenerated.length > 0) {
       try {
-        const fillRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${openrouter_api_key}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'http://localhost:5173',
-            'X-Title': 'Job Tracker',
-          },
-          body: JSON.stringify({ model, messages: [{ role: 'user', content: fillPrompt }], temperature: 0.3 }),
-        });
-        if (fillRes.ok) {
-          const fillJson = await fillRes.json();
-          let fillRaw = fillJson.choices[0].message.content.trim();
-          const fenceMatch = fillRaw.match(/```(?:json)?\s*([\s\S]*?)```/);
-          if (fenceMatch) fillRaw = fenceMatch[1].trim();
-          const newBullets = JSON.parse(fillRaw);
-          if (Array.isArray(newBullets)) {
-            const i = resumeContent.experiences.findIndex(e => e.company === exp.company && e.title === exp.title);
-            if (i !== -1) resumeContent.experiences[i].bullets.push(...newBullets.slice(0, needed));
+        const fills = await batchFillBullets(underGenerated, job, openrouter_api_key, model);
+        for (const [idxStr, newBullets] of Object.entries(fills)) {
+          const exp = underGenerated[parseInt(idxStr)];
+          if (!exp || !Array.isArray(newBullets)) continue;
+          const i = resumeContent.experiences.findIndex(e => e.company === exp.company && e.title === exp.title);
+          if (i !== -1) {
+            const needed = 3 - resumeContent.experiences[i].bullets.length;
+            resumeContent.experiences[i].bullets.push(...newBullets.slice(0, needed));
           }
         }
+        console.log(`[bullet-fill] Batch-filled ${underGenerated.length} experience(s) in one API call`);
       } catch (fillErr) {
-        console.warn(`[bullet-fill] Failed for "${exp.company} – ${exp.title}":`, fillErr.message);
+        console.warn('[bullet-fill] Batch fill failed:', fillErr.message);
       }
     }
 
     // Re-sanitize to cap at 3 after fill
     resumeContent = sanitizeResumeContent(resumeContent);
+
+    // Compute ATS keyword match score (pure JS, no API call)
+    const ats_analysis = computeAtsScore(resumeContent, keywords);
+    if (ats_analysis.score !== null) {
+      console.log(`[ats] Score: ${ats_analysis.score}% (${ats_analysis.matched_keywords.length}/${keywords.length} keywords matched)`);
+    }
 
     const kit = {
       resume_content: resumeContent,
@@ -429,6 +539,7 @@ Rules:
       cover_letter: resumeContent.cover_letter || '',
       interview_questions: resumeContent.interview_questions || [],
       company_brief: resumeContent.company_brief || '',
+      ats_analysis,
     };
 
     const idx = data.jobs.findIndex(j => j.id === job.id);
@@ -443,6 +554,15 @@ Rules:
   }
 });
 
+// ATS score read endpoint (no AI call — reads stored analysis)
+app.get('/api/jobs/:id/kit/ats-score', (req, res) => {
+  const data = readData();
+  const job = data.jobs.find(j => j.id === parseInt(req.params.id));
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (!job.kit) return res.status(400).json({ error: 'Kit not yet generated for this job' });
+  res.json({ ats_analysis: job.kit.ats_analysis || null });
+});
+
 // ---------------------------------------------------------------------------
 // Settings routes
 // ---------------------------------------------------------------------------
@@ -453,7 +573,7 @@ app.get('/api/settings', (req, res) => {
 
 app.put('/api/settings', (req, res) => {
   const data = readData();
-  const allowed = ['profile', 'openrouter_api_key', 'openrouter_model', 'apify_api_key', 'apify_actor_id'];
+  const allowed = ['profile', 'openrouter_api_key', 'openrouter_model', 'apify_api_key', 'apify_actor_id', 'keyword_model'];
   if (!data.settings) data.settings = {};
   for (const key of allowed) {
     if (key in req.body) data.settings[key] = req.body[key];
@@ -515,6 +635,175 @@ app.post('/api/parse-url', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: `Fetch failed: ${err.message}` });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Job recommendations
+// ---------------------------------------------------------------------------
+function deriveRoleAndLocation(profile = '') {
+  const rolePatterns = [
+    /seeking\s+(?:a\s+)?(?:position\s+as\s+)?([A-Za-z\s]+?)(?:\s+role|\s+position|\s+at|\.|,|$)/i,
+    /looking\s+for\s+(?:a\s+)?([A-Za-z\s]+?)(?:\s+role|\s+position|\s+at|\.|,|$)/i,
+    /aspiring\s+([A-Za-z\s]+?)(?:\s+at|\.|,|$)/i,
+  ];
+  let role = '';
+  for (const pat of rolePatterns) {
+    const m = profile.match(pat);
+    if (m) { role = m[1].trim(); break; }
+  }
+  if (!role) {
+    const titleMatch = profile.match(/\b([A-Za-z\s]+(?:Analyst|Engineer|Manager|Developer|Consultant|Associate|Researcher))\b/);
+    if (titleMatch) role = titleMatch[1].trim();
+  }
+  if (!role) role = 'Data Analyst';
+
+  const locMatch = profile.match(/\b([A-Za-z\s]+,\s*(?:CA|NY|TX|WA|IL|GA|MA|FL|CO|OR|VA|NC|AZ|OH|MI|PA))\b/);
+  const location = locMatch ? locMatch[1].trim() : 'United States';
+
+  return { role, location };
+}
+
+async function fetchAiRecommendations(role, location, limit, profile, openrouter_api_key, model) {
+  const prompt = `You are a job search advisor. Based on the candidate profile below, suggest ${limit} specific job opportunities.
+For each, name a real company and role that plausibly exists and is a strong match for this candidate.
+
+Profile:
+${(profile || '').slice(0, 2000)}
+
+Target role: ${role}
+Target location: ${location}
+
+Return ONLY a JSON array:
+[
+  {
+    "title": "Data Analyst",
+    "company": "Stripe",
+    "location": "San Francisco, CA",
+    "url": "",
+    "description": "150-300 word description of the role responsibilities and requirements",
+    "match_reasoning": "1-2 sentences citing specific skills or experiences from the profile that match"
+  }
+]
+
+Rules:
+- Name real companies that actively hire ${role} roles at a student/entry level
+- match_reasoning must reference specific details from the profile (skills, projects, coursework)
+- description must be 150-300 words of realistic JD content for this role
+- Vary company size: include a mix of large tech, mid-size, and startups`;
+
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${openrouter_api_key}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'http://localhost:5173',
+      'X-Title': 'Job Tracker',
+    },
+    body: JSON.stringify({
+      model: model || 'anthropic/claude-sonnet-4-5',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+    }),
+  });
+  if (!res.ok) throw new Error(`AI recommendations failed: ${res.status}`);
+  const json = await res.json();
+  let raw = json.choices[0].message.content.trim();
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) raw = fenceMatch[1].trim();
+  const recs = JSON.parse(raw);
+  return Array.isArray(recs) ? recs : [];
+}
+
+async function fetchApifyRecommendations(role, location, limit, apify_api_key, apify_actor_id) {
+  const res = await fetch(
+    `https://api.apify.com/v2/acts/${apify_actor_id}/run-sync-get-dataset-items?token=${apify_api_key}&timeout=60`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ position: role, location, maxItems: limit }),
+    }
+  );
+  if (!res.ok) throw new Error(`Apify job search failed: ${res.status}`);
+  const items = await res.json();
+  if (!Array.isArray(items)) return [];
+  return items.map(item => ({
+    title: item.title || item.positionName || role,
+    company: item.company || item.companyName || '',
+    location: item.location || location,
+    url: item.url || item.jobUrl || '',
+    description: item.description || item.text || '',
+    match_reasoning: '',
+  }));
+}
+
+app.post('/api/recommendations', async (req, res) => {
+  try {
+    const data = readData();
+    const { openrouter_api_key, openrouter_model, profile, apify_api_key, apify_actor_id } = data.settings || {};
+    if (!openrouter_api_key && !apify_api_key) {
+      return res.status(400).json({ error: 'OpenRouter API key not configured in Settings' });
+    }
+
+    const limit = Math.min(parseInt(req.body.limit) || 10, 20);
+    const { role: derivedRole, location: derivedLocation } = deriveRoleAndLocation(profile || '');
+    const role = req.body.role || derivedRole;
+    const location = req.body.location || derivedLocation;
+
+    let recommendations, source;
+    if (apify_api_key && apify_actor_id) {
+      try {
+        recommendations = await fetchApifyRecommendations(role, location, limit, apify_api_key, apify_actor_id);
+        source = 'apify';
+      } catch (apifyErr) {
+        console.warn('Apify recommendations failed, falling back to AI:', apifyErr.message);
+        recommendations = await fetchAiRecommendations(role, location, limit, profile, openrouter_api_key, openrouter_model);
+        source = 'ai';
+      }
+    } else {
+      recommendations = await fetchAiRecommendations(role, location, limit, profile, openrouter_api_key, openrouter_model);
+      source = 'ai';
+    }
+
+    if (!data.nextRecId) data.nextRecId = 1;
+    const now = new Date().toISOString();
+    const stamped = recommendations.map(r => ({
+      ...r,
+      id: `rec_${data.nextRecId++}`,
+      source,
+      created_at: now,
+    }));
+    data.recommendations = stamped;
+    writeData(data);
+
+    res.json({ source, recommendations: stamped });
+  } catch (err) {
+    console.error('Recommendations error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/recommendations/:recId/save', (req, res) => {
+  const data = readData();
+  const rec = (data.recommendations || []).find(r => r.id === req.params.recId);
+  if (!rec) return res.status(404).json({ error: 'Recommendation not found' });
+
+  const now = new Date().toISOString();
+  const job = {
+    id: data.nextId++,
+    title: rec.title || '',
+    company: rec.company || '',
+    location: rec.location || '',
+    url: rec.url || '',
+    description: rec.description || '',
+    status: 'Saved',
+    notes: rec.match_reasoning ? `Recommended: ${rec.match_reasoning}` : '',
+    kit: null,
+    created_at: now,
+    updated_at: now,
+  };
+  data.jobs.push(job);
+  writeData(data);
+  res.status(201).json({ job });
 });
 
 // ---------------------------------------------------------------------------
