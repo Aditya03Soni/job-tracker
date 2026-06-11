@@ -807,8 +807,90 @@ app.post('/api/recommendations/:recId/save', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Daily Apify recommendation refresh
+// ---------------------------------------------------------------------------
+const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function refreshRecommendations() {
+  const data = readData();
+  const { apify_api_key, apify_actor_id, openrouter_api_key, openrouter_model, profile } = data.settings || {};
+
+  if (!apify_api_key || !apify_actor_id) {
+    console.log('[daily-refresh] Skipped — Apify not configured.');
+    return;
+  }
+
+  const { role, location } = deriveRoleAndLocation(profile || '');
+  console.log(`[daily-refresh] Fetching Apify recommendations for "${role}" in "${location}"...`);
+
+  try {
+    let recommendations, source;
+    try {
+      recommendations = await fetchApifyRecommendations(role, location, 10, apify_api_key, apify_actor_id);
+      source = 'apify';
+    } catch (apifyErr) {
+      console.warn('[daily-refresh] Apify failed, falling back to AI:', apifyErr.message);
+      if (!openrouter_api_key) throw apifyErr;
+      recommendations = await fetchAiRecommendations(role, location, 10, profile, openrouter_api_key, openrouter_model);
+      source = 'ai';
+    }
+
+    const fresh = readData(); // re-read in case settings changed during fetch
+    if (!fresh.nextRecId) fresh.nextRecId = 1;
+    const now = new Date().toISOString();
+    fresh.recommendations = recommendations.map(r => ({
+      ...r,
+      id: `rec_${fresh.nextRecId++}`,
+      source,
+      created_at: now,
+    }));
+    fresh.last_rec_refresh = now;
+    writeData(fresh);
+    console.log(`[daily-refresh] Stored ${recommendations.length} recommendations (source: ${source}).`);
+  } catch (err) {
+    console.error('[daily-refresh] Failed:', err.message);
+  }
+}
+
+function scheduleRefresh() {
+  const data = readData();
+  const last = data.last_rec_refresh ? new Date(data.last_rec_refresh).getTime() : 0;
+  const age = Date.now() - last;
+
+  if (age >= REFRESH_INTERVAL_MS) {
+    console.log('[daily-refresh] Recommendations are stale — refreshing now...');
+    refreshRecommendations();
+  } else {
+    const nextMs = REFRESH_INTERVAL_MS - age;
+    console.log(`[daily-refresh] Next refresh in ${Math.round(nextMs / 3600000 * 10) / 10}h`);
+  }
+
+  // Re-check every hour so a long-running server catches the next window
+  setInterval(() => {
+    const d = readData();
+    const lastTs = d.last_rec_refresh ? new Date(d.last_rec_refresh).getTime() : 0;
+    if (Date.now() - lastTs >= REFRESH_INTERVAL_MS) {
+      console.log('[daily-refresh] 24h elapsed — refreshing recommendations...');
+      refreshRecommendations();
+    }
+  }, 60 * 60 * 1000);
+}
+
+// Manual trigger endpoint
+app.post('/api/recommendations/refresh', async (req, res) => {
+  try {
+    await refreshRecommendations();
+    const data = readData();
+    res.json({ ok: true, count: (data.recommendations || []).length, last_refresh: data.last_rec_refresh });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`Job Tracker server running on http://localhost:${PORT}`);
+  scheduleRefresh();
 });

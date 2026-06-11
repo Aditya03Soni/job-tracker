@@ -29,5 +29,6 @@ export const api = {
   recommendations: {
     get: body => json('POST', '/recommendations', body),
     save: recId => req(`/recommendations/${recId}/save`, { method: 'POST' }),
+    refresh: () => req('/recommendations/refresh', { method: 'POST' }),
   },
 }

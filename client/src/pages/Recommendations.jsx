@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { api } from '../api.js'
 
 export default function Recommendations({ onSelectJob }) {
@@ -6,9 +6,11 @@ export default function Recommendations({ onSelectJob }) {
   const [location, setLocation] = useState('')
   const [limit, setLimit] = useState(10)
   const [loading, setLoading] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState(null)
   const [recs, setRecs] = useState([])
   const [source, setSource] = useState(null)
+  const [lastRefresh, setLastRefresh] = useState(null)
   const [saved, setSaved] = useState(new Set())
   const [savedJobIds, setSavedJobIds] = useState({})
 
@@ -32,6 +34,30 @@ export default function Recommendations({ onSelectJob }) {
     }
   }
 
+  async function manualRefresh() {
+    setRefreshing(true)
+    setError(null)
+    try {
+      const result = await api.recommendations.refresh()
+      if (result.error) throw new Error(result.error)
+      setLastRefresh(new Date().toISOString())
+      // Re-fetch to display the new list
+      const fresh = await api.recommendations.get(
+        Object.assign({ limit }, role.trim() ? { role } : {}, location.trim() ? { location } : {})
+      )
+      if (!fresh.error) {
+        setRecs(fresh.recommendations || [])
+        setSource(fresh.source)
+        setSaved(new Set())
+        setSavedJobIds({})
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   async function saveRec(rec) {
     const result = await api.recommendations.save(rec.id)
     if (result.job) {
@@ -40,10 +66,26 @@ export default function Recommendations({ onSelectJob }) {
     }
   }
 
+  function fmtRefresh(iso) {
+    if (!iso) return null
+    const d = new Date(iso)
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
   return (
     <div>
       <div className="page-header">
-        <h1>Recommendations</h1>
+        <div>
+          <h1>Recommendations</h1>
+          {lastRefresh && (
+            <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
+              Last refreshed: {fmtRefresh(lastRefresh)}
+            </div>
+          )}
+        </div>
+        <button className="btn-secondary" onClick={manualRefresh} disabled={refreshing}>
+          {refreshing ? 'Refreshing…' : '↻ Refresh Apify'}
+        </button>
       </div>
 
       <div className="rec-controls">
