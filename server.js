@@ -564,6 +564,112 @@ app.get('/api/jobs/:id/kit/ats-score', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Rank all jobs by fit score (AI)
+// ---------------------------------------------------------------------------
+app.post('/api/jobs/rank-all', async (req, res) => {
+  const data = readData();
+  const { openrouter_api_key, openrouter_model, profile } = data.settings || {};
+  if (!openrouter_api_key) return res.status(400).json({ error: 'OpenRouter API key not configured' });
+  if (!profile) return res.status(400).json({ error: 'Profile not configured in settings' });
+
+  const jobs = data.jobs;
+  if (jobs.length === 0) return res.json({ ranked: 0, jobs: [] });
+
+  const summaries = jobs.map(j =>
+    `ID ${j.id}: ${j.title} at ${j.company}${j.location ? `, ${j.location}` : ''}. Description: ${(j.description || '').slice(0, 300)}`
+  ).join('\n');
+
+  const prompt = `You are a career coach. Given a candidate profile and a list of job postings, rate each job's fit on a 0-100 scale.
+
+Candidate profile:
+${profile.slice(0, 1000)}
+
+Jobs:
+${summaries}
+
+Return a JSON array with one object per job: [{ "id": <number>, "fit_score": <0-100>, "fit_reason": "<one sentence>" }, ...]
+Return ONLY valid JSON, no markdown.`;
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openrouter_api_key}` },
+      body: JSON.stringify({
+        model: openrouter_model || 'anthropic/claude-3.5-sonnet',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+      }),
+    });
+    const aiRes = await response.json();
+    const raw = aiRes.choices?.[0]?.message?.content || '[]';
+    const rankings = JSON.parse(raw.replace(/```json|```/g, '').trim());
+
+    let ranked = 0;
+    for (const r of rankings) {
+      const job = data.jobs.find(j => j.id === r.id);
+      if (!job) continue;
+      job.fit_score = r.fit_score;
+      job.fit_reason = r.fit_reason;
+      ranked++;
+    }
+    writeData(data);
+    res.json({ ranked, jobs: data.jobs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Apify sync — fetch Apify jobs and add new ones as tracked jobs
+// ---------------------------------------------------------------------------
+app.post('/api/apify/sync', async (req, res) => {
+  const data = readData();
+  const { apify_api_key, apify_actor_id } = data.settings || {};
+  if (!apify_api_key || !apify_actor_id) return res.status(400).json({ error: 'Apify API key and actor ID not configured' });
+
+  try {
+    const apifyRes = await fetch(
+      `https://api.apify.com/v2/acts/${apify_actor_id}/run-sync-get-dataset-items?token=${apify_api_key}&timeout=60`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }
+    );
+    const items = await apifyRes.json();
+    if (!Array.isArray(items)) return res.status(500).json({ error: 'Unexpected Apify response format' });
+
+    let added = 0;
+    let skipped = 0;
+    const existingUrls = new Set(data.jobs.map(j => j.url).filter(Boolean));
+
+    for (const item of items) {
+      const url = item.url || item.jobUrl || item.link || '';
+      if (url && existingUrls.has(url)) { skipped++; continue; }
+
+      const now = new Date().toISOString();
+      const job = {
+        id: data.nextId++,
+        title: item.title || item.position || 'Unknown Title',
+        company: item.company || item.companyName || 'Unknown Company',
+        location: item.location || '',
+        url,
+        description: item.description || item.jobDescription || '',
+        status: 'Saved',
+        notes: '',
+        kit: null,
+        created_at: now,
+        updated_at: now,
+      };
+      data.jobs.push(job);
+      if (url) existingUrls.add(url);
+      added++;
+    }
+
+    writeData(data);
+    res.json({ added, skipped, total: items.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Settings routes
 // ---------------------------------------------------------------------------
 app.get('/api/settings', (req, res) => {

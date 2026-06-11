@@ -1,4 +1,4 @@
-const BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api')
+const BASE = import.meta.env.DEV ? 'http://localhost:3001/api' : '/api'
 
 async function req(path, opts = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -20,12 +20,16 @@ export const api = {
     update: (id, body) => json('PUT', `/jobs/${id}`, body),
     delete: id => req(`/jobs/${id}`, { method: 'DELETE' }),
     generateKit: id => req(`/jobs/${id}/kit`, { method: 'POST' }),
+    rankAll: () => req('/jobs/rank-all', { method: 'POST' }),
   },
   settings: {
     get: () => req('/settings'),
     update: body => json('PUT', '/settings', body),
   },
   parseUrl: url => json('POST', '/parse-url', { url }),
+  apify: {
+    sync: () => req('/apify/sync', { method: 'POST' }),
+  },
   recommendations: {
     get: body => json('POST', '/recommendations', body),
     save: recId => req(`/recommendations/${recId}/save`, { method: 'POST' }),
